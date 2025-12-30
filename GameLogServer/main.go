@@ -9,9 +9,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -27,9 +32,11 @@ import (
 
 // 유저 데이터
 type UserProfile struct {
-	UserID    string `json:"user_id" bson:"user_id"`       // Unity PlayerID
-	Nickname  string `json:"nickname" bson:"nickname"`     // 닉네임
-	CreatedAt int64  `json:"created_at" bson:"created_at"` // 가입일
+	UserID        string `json:"user_id" bson:"user_id"`       // Unity PlayerID
+	Nickname      string `json:"nickname" bson:"nickname"`     // 닉네임
+	CreatedAt     int64  `json:"created_at" bson:"created_at"` // 가입일
+	WeaponIconURL string `json:"weapon_icon_url" bson:"weapon_icon_url"`
+	SkillIconURL  string `json:"skill_icon_url" bson:"skill_icon_url"`
 }
 
 // Unity에서 받을 로그 데이터
@@ -77,6 +84,8 @@ var logCollection *mongo.Collection
 var storyCollection *mongo.Collection
 var ctx = context.Background()
 
+var s3Client *s3.Client
+
 // OpenAI API 키
 const GeminiAPIKey = ""
 
@@ -112,6 +121,8 @@ func main() {
 	storyCollection = db.Collection("user_stories")
 	fmt.Println("✔ MongoDB Connected")
 
+	initS3()
+
 	// 스케줄러 설정 (배치 작업)
 	c := cron.New()
 	// "@every 3h" -> 3시간마다 실행
@@ -136,6 +147,9 @@ func main() {
 	fmt.Println("[Server Log]: Getting Data form DB on [api/stories/:user_id]")
 	app.Get("/api/stories/:user_id", GetUserStories)
 
+	fmt.Println("[Server Log]: Posting Image on [/api/upload/image]")
+	app.Post("/api/upload/image", UploadImageToS3)
+
 	// 서버 시작
 	fmt.Println("[Server]: 플레이어의 로그를 기반한 AI 이야기 생성은 5분마다 생성됩니다.")
 	fmt.Println("[Server]: 해당 플레이어의 로그의 개수가 5개 미만일 시 이야기는 생성되지 않습니다.")
@@ -159,6 +173,108 @@ func GetUserProfile(c *fiber.Ctx) error {
 		return c.Status(500).SendString("DB Error")
 	}
 	return c.JSON(user)
+}
+
+func initS3() {
+	// 환경 변수에서 키 가져오기
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	region := os.Getenv("AWS_REGION")
+
+	if accessKey == "" || secretKey == "" || region == "" {
+		log.Fatal("X AWS 환경변수(AccessKey, SecretKey, Region)가 설정되지 않았습니다.")
+	}
+
+	// 자격 증명 로드
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+	)
+	if err != nil {
+		log.Fatal("X AWS 설정 로드 실패: ", err)
+	}
+
+	s3Client = s3.NewFromConfig(cfg)
+	fmt.Println("✔ AWS S3 Client Connected")
+}
+
+func UploadImageToS3(c *fiber.Ctx) error {
+	// 1. 이미지 파일 받기
+	file, err := c.FormFile("image")
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "이미지 파일을 찾을 수 없습니다."})
+	}
+
+	src, err := file.Open()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "파일을 열 수 없습니다."})
+	}
+	defer src.Close()
+
+	// 2. 파라미터 받기 (UserID, ImageType)
+	userID := c.FormValue("user_id")
+	imageType := c.FormValue("image_type") // "weapon" 또는 "skill"
+
+	if userID == "" || (imageType != "weapon" && imageType != "skill") {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id 또는 올바른 image_type(weapon/skill)이 필요합니다."})
+	}
+
+	// 3. 파일명 및 DB 필드 결정 (타입에 따라 고정 이름 사용 -> 자동 덮어쓰기)
+	ext := filepath.Ext(file.Filename)
+	if ext == "" {
+		ext = ".png"
+	} // 확장자 없으면 기본 png
+
+	var s3Filename string
+	var dbField string
+
+	if imageType == "weapon" {
+		s3Filename = "weapon_icon" + ext
+		dbField = "weapon_icon_url"
+	} else {
+		s3Filename = "skill_icon" + ext
+		dbField = "skill_icon_url"
+	}
+
+	// S3 경로: 유저ID/weapon_icon.png (폴더 정리)
+	s3Key := fmt.Sprintf("%s/%s", userID, s3Filename)
+
+	// 4. S3 업로드
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(s3Key),
+		Body:        src,
+		ContentType: aws.String(file.Header.Get("Content-Type")),
+	})
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "S3 업로드 실패", "detail": err.Error()})
+	}
+
+	// URL 생성
+	region := os.Getenv("AWS_REGION")
+	fileURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, region, s3Key)
+	fmt.Printf("✔ [%s] 이미지 업로드 완료: %s\n", imageType, fileURL)
+
+	// 5. MongoDB 업데이트 (선택된 필드만 수정)
+	filter := bson.M{"user_id": userID}
+	update := bson.M{
+		"$set": bson.M{
+			dbField: fileURL, // weapon_icon_url 또는 skill_icon_url 만 업데이트
+		},
+	}
+
+	_, err = userCollection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		log.Println("⚠ DB 업데이트 실패:", err)
+		return c.Status(500).JSON(fiber.Map{"status": "upload_success_but_db_failed", "image_url": fileURL})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":    "success",
+		"type":      imageType,
+		"image_url": fileURL,
+	})
 }
 
 // 닉네임 등록/수정
