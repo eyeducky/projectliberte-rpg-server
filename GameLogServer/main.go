@@ -32,9 +32,11 @@ import (
 
 // 유저 데이터
 type UserProfile struct {
-	UserID    string `json:"user_id" bson:"user_id"`       // Unity PlayerID
-	Nickname  string `json:"nickname" bson:"nickname"`     // 닉네임
-	CreatedAt int64  `json:"created_at" bson:"created_at"` // 가입일
+	UserID        string `json:"user_id" bson:"user_id"`       // Unity PlayerID
+	Nickname      string `json:"nickname" bson:"nickname"`     // 닉네임
+	CreatedAt     int64  `json:"created_at" bson:"created_at"` // 가입일
+	WeaponIconURL string `json:"weapon_icon_url" bson:"weapon_icon_url"`
+	SkillIconURL  string `json:"skill_icon_url" bson:"skill_icon_url"`
 }
 
 // Unity에서 받을 로그 데이터
@@ -197,68 +199,80 @@ func initS3() {
 }
 
 func UploadImageToS3(c *fiber.Ctx) error {
-	// 1. 유니티(클라이언트)에서 보낸 파일 받기 (key: "image")
+	// 1. 이미지 파일 받기
 	file, err := c.FormFile("image")
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "이미지 파일을 찾을 수 없습니다."})
 	}
 
-	// 2. 파일 스트림 열기
 	src, err := file.Open()
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "파일을 열 수 없습니다."})
 	}
 	defer src.Close()
 
-	// 3. 파일명 생성 로직 (덮어쓰기 지원)
-	userID := c.FormValue("user_id", "unknown")
-	customFilename := c.FormValue("filename") // 유니티에서 보낸 고정 파일명 (없을 수도 있음)
-	ext := filepath.Ext(file.Filename)        // 원본 확장자 (.png 등)
+	// 2. 파라미터 받기 (UserID, ImageType)
+	userID := c.FormValue("user_id")
+	imageType := c.FormValue("image_type") // "weapon" 또는 "skill"
 
-	var s3Key string
+	if userID == "" || (imageType != "weapon" && imageType != "skill") {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id 또는 올바른 image_type(weapon/skill)이 필요합니다."})
+	}
 
-	if customFilename != "" {
-		// [덮어쓰기 모드]
-		// 유니티가 "my_profile" 처럼 확장자 없이 보냈을 경우를 대비해 확장자 추가
-		if filepath.Ext(customFilename) == "" {
-			customFilename += ext
-		}
-		// S3 경로: userID/지정한파일명 (예: player1/profile.png)
-		// 이렇게 하면 같은 유저가 같은 이름으로 올릴 때마다 덮어씌워집니다.
-		s3Key = fmt.Sprintf("%s/%s", userID, customFilename)
+	// 3. 파일명 및 DB 필드 결정 (타입에 따라 고정 이름 사용 -> 자동 덮어쓰기)
+	ext := filepath.Ext(file.Filename)
+	if ext == "" {
+		ext = ".png"
+	} // 확장자 없으면 기본 png
+
+	var s3Filename string
+	var dbField string
+
+	if imageType == "weapon" {
+		s3Filename = "weapon_icon" + ext
+		dbField = "weapon_icon_url"
 	} else {
-		// [기본 모드 - 중복 방지]
-		// 기존 로직: userID/userID_시간_파일명 (예: player1/player1_123456.png)
-		s3Key = fmt.Sprintf("%s/%s_%d%s", userID, userID, time.Now().UnixNano(), ext)
+		s3Filename = "skill_icon" + ext
+		dbField = "skill_icon_url"
 	}
 
-	bucketName := os.Getenv("AWS_BUCKET_NAME")
-	if bucketName == "" {
-		return c.Status(500).JSON(fiber.Map{"error": "서버 S3 버킷 설정 오류"})
-	}
+	// S3 경로: 유저ID/weapon_icon.png (폴더 정리)
+	s3Key := fmt.Sprintf("%s/%s", userID, s3Filename)
 
-	// 4. S3 업로드 실행
+	// 4. S3 업로드
+	bucketName := os.Getenv("S3_BUCKET_NAME")
 	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(bucketName),
-		Key:         aws.String(s3Key), // 생성한 키 사용
+		Key:         aws.String(s3Key),
 		Body:        src,
 		ContentType: aws.String(file.Header.Get("Content-Type")),
-		// ACL:         types.ObjectCannedACLPublicRead, // 필요시 주석 해제
 	})
-
 	if err != nil {
-		log.Println("S3 Upload Error:", err)
-		return c.Status(500).JSON(fiber.Map{"error": "S3 업로드 실패"})
+		return c.Status(500).JSON(fiber.Map{"error": "S3 업로드 실패", "detail": err.Error()})
 	}
 
-	// 5. 업로드된 URL 생성
+	// URL 생성
 	region := os.Getenv("AWS_REGION")
 	fileURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, region, s3Key)
+	fmt.Printf("✔ [%s] 이미지 업로드 완료: %s\n", imageType, fileURL)
 
-	fmt.Printf("✔ 이미지 업로드 완료 (덮어쓰기 가능): %s\n", fileURL)
+	// 5. MongoDB 업데이트 (선택된 필드만 수정)
+	filter := bson.M{"user_id": userID}
+	update := bson.M{
+		"$set": bson.M{
+			dbField: fileURL, // weapon_icon_url 또는 skill_icon_url 만 업데이트
+		},
+	}
+
+	_, err = userCollection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		log.Println("⚠ DB 업데이트 실패:", err)
+		return c.Status(500).JSON(fiber.Map{"status": "upload_success_but_db_failed", "image_url": fileURL})
+	}
 
 	return c.JSON(fiber.Map{
 		"status":    "success",
+		"type":      imageType,
 		"image_url": fileURL,
 	})
 }
