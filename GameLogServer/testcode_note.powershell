@@ -1,0 +1,85 @@
+# 서버 주소 및 유저 ID 설정
+$urlLog = "http://34.158.198.158:8000/api/log"
+$urlNick = "http://34.158.198.158:8000/api/user/nickname"
+$userID = "hero_user_001" 
+
+# 닉네임 설정 (AI가 이 이름을 사용함)
+$nickBody = @{
+    user_id  = $userID
+    nickname = "불꽃의기사" 
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri $urlNick -Method Post -Body $nickBody -ContentType "application/json; charset=utf-8"
+Write-Host "닉네임 설정 완료: 불꽃의기사" -ForegroundColor Cyan
+Write-Host "--------------------------------"
+
+# 로그 전송 (던전 입장 -> 위기 -> 역전 -> 승리 -> 보상)
+# 던전 입장
+$log1 = @{
+    user_id    = $userID
+    event_type = "DungeonEnter"
+    detail     = @{
+        dungeon_name = "Whispering Catacomb" # 속삭이는 지하묘지
+        difficulty   = "Hard"
+        weather      = "Gloomy"
+    }
+} | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri $urlLog -Method Post -Body $log1 -ContentType "application/json; charset=utf-8"
+Write-Host "로그 1 전송: 던전 입장"
+
+# 함정 발동 (위기)
+$log2 = @{
+    user_id    = $userID
+    event_type = "TrapTriggered"
+    detail     = @{
+        trap_type = "Poison Arrow"
+        damage    = 30
+        status    = "Poisoned"
+        hp_left   = 70
+    }
+} | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri $urlLog -Method Post -Body $log2 -ContentType "application/json; charset=utf-8"
+Write-Host "로그 2 전송: 함정 발동 (체력 감소)"
+
+# 보스 조우 및 치명타 (긴장감)
+$log3 = @{
+    user_id    = $userID
+    event_type = "BossEncounter"
+    detail     = @{
+        boss_name = "Skeleton King"
+        action    = "Roar"
+        dialogue  = "Who dares disturb my sleep!"
+    }
+} | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri $urlLog -Method Post -Body $log3 -ContentType "application/json; charset=utf-8"
+Write-Host "로그 3 전송: 보스 조우"
+
+# 보스 처치 (절정)
+$log4 = @{
+    user_id    = $userID
+    event_type = "MonsterKill"
+    detail     = @{
+        monster_name = "Skeleton King"
+        skill_used   = "Fire Slash" # 필살기 사용
+        is_critical  = $true        # 크리티컬!
+        exp_gained   = 5000
+    }
+} | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri $urlLog -Method Post -Body $log4 -ContentType "application/json; charset=utf-8"
+Write-Host "로그 4 전송: 보스 처치 (크리티컬)"
+
+# 전설 아이템 획득 (결말/보상)
+$log5 = @{
+    user_id    = $userID
+    event_type = "ItemGet"
+    detail     = @{
+        item_name = "Crown of Bones"
+        grade     = "Legendary"
+        option    = "Life Steal +10%"
+    }
+} | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri $urlLog -Method Post -Body $log5 -ContentType "application/json; charset=utf-8"
+Write-Host "로그 5 전송: 전설 아이템 획득"
+
+Write-Host "--------------------------------"
+Write-Host "✅ 모든 로그 전송 완료! 1분 뒤 서버 로그를 확인하세요." -ForegroundColor Green
