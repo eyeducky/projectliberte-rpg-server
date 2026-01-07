@@ -54,7 +54,8 @@ type AuthUser struct {
 	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	LoginID      string             `bson:"login_id" json:"login_id"`
 	PasswordHash string             `bson:"password_hash" json:"-"`
-	ExternalID   string             `bson:"external_id" json:"external_id"` // Custom ID sign-in에 들어갈 고유값
+	ExternalID   string             `bson:"external_id" json:"external_id"`
+	UnityUserID  string             `bson:"unity_user_id,omitempty" json:"unity_user_id,omitempty"`
 	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
 }
 
@@ -181,9 +182,14 @@ func getStatelessServiceToken() (string, error) {
 
 	cred := base64.StdEncoding.EncodeToString([]byte(keyID + ":" + secret))
 
-	url := fmt.Sprintf("https://services.api.unity.com/auth/v1/token-exchange?projectId=%s&environmentId=%s", projectID, envID)
+	url := fmt.Sprintf(
+		"https://services.api.unity.com/auth/v1/token-exchange?projectId=%s&environmentId=%s",
+		projectID, envID,
+	)
+
 	req, _ := http.NewRequest("POST", url, nil)
 	req.Header.Set("Authorization", "Basic "+cred)
+	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.Do(req)
@@ -193,8 +199,15 @@ func getStatelessServiceToken() (string, error) {
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
+
+	// 200만 보지 말고 2xx 전체를 성공으로 처리
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("token-exchange 실패: %d / %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// (참고) 정상이라면 body에 accessToken이 와야 함. :contentReference[oaicite:2]{index=2}
+	if len(bodyBytes) == 0 {
+		return "", fmt.Errorf("token-exchange 성공(%d)인데 body가 비어있음. headers=%v", resp.StatusCode, resp.Header)
 	}
 
 	var te TokenExchangeResponse
@@ -342,6 +355,98 @@ func verifyUnityIDToken(idToken string) (jwt.MapClaims, error) {
 	return claims, nil
 }
 
+/// ========== Web 세션 JWT 발급 ===========
+
+type WebClaims struct {
+	AuthUserID string `json:"auth_user_id"`
+	LoginID    string `json:"login_id"`
+	jwt.RegisteredClaims
+}
+
+func webSecret() []byte {
+	s := os.Getenv("WEB_JWT_SECRET")
+	if s == "" {
+		// 포트폴리오라도 빈 값이면 위험하니까 바로 죽이는 게 안전
+		log.Fatal("WEB_JWT_SECRET is not set")
+	}
+	return []byte(s)
+}
+
+func signWebToken(authUserID, loginID string) (string, error) {
+	claims := WebClaims{
+		AuthUserID: authUserID,
+		LoginID:    loginID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   authUserID,
+			Issuer:    "my-go-server",
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)), // 7일
+		},
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return t.SignedString(webSecret())
+}
+
+func parseWebToken(tokenStr string) (*WebClaims, error) {
+	claims := new(WebClaims)
+	parser := jwt.NewParser(jwt.WithValidMethods([]string{"HS256"}), jwt.WithLeeway(30*time.Second))
+	tok, err := parser.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+		return webSecret(), nil
+	})
+	if err != nil || tok == nil || !tok.Valid {
+		return nil, fmt.Errorf("invalid web token")
+	}
+	return claims, nil
+}
+
+// / ========== 개발자 우회 미들웨어 ===========
+func RequireDevBypass(c *fiber.Ctx) error {
+	if os.Getenv("DEV_BYPASS_ENABLED") != "true" {
+		return c.Status(404).JSON(fiber.Map{"error": "not found"})
+	}
+	key := c.Get("X-Dev-Key")
+	if key == "" || key != os.Getenv("DEV_BYPASS_KEY") {
+		return c.Status(401).JSON(fiber.Map{"error": "dev key required"})
+	}
+	return c.Next()
+}
+
+/// ========== 웹 인증 미들웨어 ===========
+
+func RequireWebAuth(c *fiber.Ctx) error {
+	// 1) 쿠키 우선
+	tokenStr := c.Cookies("sid")
+
+	// 2) 없으면 Authorization: Bearer
+	if tokenStr == "" {
+		auth := c.Get("Authorization")
+		if strings.HasPrefix(auth, "Bearer ") {
+			tokenStr = strings.TrimPrefix(auth, "Bearer ")
+		}
+	}
+
+	if tokenStr == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "missing web session"})
+	}
+
+	claims, err := parseWebToken(tokenStr)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "invalid web session"})
+	}
+
+	c.Locals("auth_user_id", claims.AuthUserID)
+	c.Locals("login_id", claims.LoginID)
+	return c.Next()
+}
+
+func getAuthedAuthUserID(c *fiber.Ctx) string {
+	v := c.Locals("auth_user_id")
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
 /// ========== Fiber 미들웨어 ==========
 
 func RequireUnityAuth(c *fiber.Ctx) error {
@@ -431,6 +536,125 @@ func issueUnityTokensForExternalID(externalID string) (*CustomIDSignInResponse, 
 	return &out, nil
 }
 
+/// ========== 웹 로그인 ===========
+
+func WebLogin(c *fiber.Ctx) error {
+	var req LoginRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON"})
+	}
+	req.LoginID = strings.TrimSpace(req.LoginID)
+	if req.LoginID == "" || req.Password == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "login_id and password are required"})
+	}
+
+	var user AuthUser
+	err := authCollection.FindOne(ctx, bson.M{"login_id": req.LoginID}).Decode(&user)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "invalid credentials"})
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "invalid credentials"})
+	}
+
+	token, err := signWebToken(user.ID.Hex(), user.LoginID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "token issue failed"})
+	}
+
+	// 쿠키 세팅 (웹 전용)
+	secure := os.Getenv("WEB_COOKIE_SECURE") == "true"
+	domain := os.Getenv("WEB_COOKIE_DOMAIN")
+
+	cookie := new(fiber.Cookie)
+	cookie.Name = "sid"
+	cookie.Value = token
+	cookie.HTTPOnly = true
+	cookie.Secure = secure
+	cookie.SameSite = "Lax" // 포트폴리오 기본값으로 무난
+	cookie.Path = "/"
+	cookie.Expires = time.Now().Add(7 * 24 * time.Hour)
+	if domain != "" {
+		cookie.Domain = domain
+	}
+	c.Cookie(cookie)
+
+	return c.JSON(fiber.Map{
+		"status":   "success",
+		"login_id": user.LoginID,
+	})
+}
+
+func WebLogout(c *fiber.Ctx) error {
+	c.Cookie(&fiber.Cookie{
+		Name:     "sid",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0),
+		HTTPOnly: true,
+	})
+	return c.JSON(fiber.Map{"status": "success"})
+}
+
+func WebMe(c *fiber.Ctx) error {
+	authID := getAuthedAuthUserID(c)
+	oid, err := primitive.ObjectIDFromHex(authID)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "bad auth_user_id"})
+	}
+
+	var user AuthUser
+	if err := authCollection.FindOne(ctx, bson.M{"_id": oid}).Decode(&user); err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "user not found"})
+	}
+
+	return c.JSON(fiber.Map{
+		"login_id":      user.LoginID,
+		"external_id":   user.ExternalID,
+		"unity_user_id": user.UnityUserID, // 없을 수도 있음
+	})
+}
+
+func WebIssueUnityTokens(c *fiber.Ctx) error {
+	authID := getAuthedAuthUserID(c)
+	oid, err := primitive.ObjectIDFromHex(authID)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "bad auth_user_id"})
+	}
+
+	var user AuthUser
+	if err := authCollection.FindOne(ctx, bson.M{"_id": oid}).Decode(&user); err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "user not found"})
+	}
+
+	tokens, err := issueUnityTokensForExternalID(user.ExternalID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "unity token issue failed", "detail": err.Error()})
+	}
+
+	// unity_user_id(sub)를 auth_users에 저장해두면 웹에서도 매핑이 쉬움
+	unitySub := ""
+	if claims, err := verifyUnityIDToken(tokens.IDToken); err == nil {
+		if s, ok := claims["sub"].(string); ok {
+			unitySub = s
+		}
+	}
+
+	if unitySub != "" && unitySub != user.UnityUserID {
+		_, _ = authCollection.UpdateOne(ctx,
+			bson.M{"_id": oid},
+			bson.M{"$set": bson.M{"unity_user_id": unitySub}},
+		)
+	}
+
+	return c.JSON(AuthTokenResponse{
+		UserID:       tokens.UserID,
+		AccessToken:  tokens.IDToken,
+		SessionToken: tokens.SessionToken,
+		ExpiresIn:    tokens.ExpiresIn,
+	})
+}
+
 /// ========== main ==========
 
 func main() {
@@ -471,14 +695,27 @@ func main() {
 	// Fiber
 	app := fiber.New()
 	app.Use(logger.New())
+
+	webOrigin := os.Getenv("WEB_ORIGIN")
+	if webOrigin == "" {
+		webOrigin = "http://localhost:5173"
+	}
+
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization, UnityEnvironment, ProjectId",
+		AllowOrigins:     webOrigin, // ★ "*" 금지 webOrigin 사용
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowCredentials: true, // ★ 쿠키 사용
 	}))
 
 	/// ---- Auth (public) ----
 	app.Post("/api/auth/register", Register)
 	app.Post("/api/auth/login", Login)
+
+	// Web session auth
+	app.Post("/api/web/login", WebLogin)
+	app.Post("/api/web/logout", WebLogout)
+	app.Get("/api/web/me", RequireWebAuth, WebMe)
+	app.Get("/api/web/unity-tokens", RequireWebAuth, WebIssueUnityTokens)
 
 	/// ---- User APIs (protected) ----
 	app.Get("/api/user/profile/:id", RequireUnityAuth, GetUserProfile)
@@ -559,6 +796,15 @@ func Login(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "unity token issue failed", "detail": err.Error()})
 	}
 
+	if claims, err := verifyUnityIDToken(tokens.IDToken); err == nil {
+		if sub, ok := claims["sub"].(string); ok && sub != "" && sub != user.UnityUserID {
+			_, _ = authCollection.UpdateOne(ctx,
+				bson.M{"_id": user.ID},
+				bson.M{"$set": bson.M{"unity_user_id": sub}},
+			)
+		}
+	}
+
 	return c.JSON(AuthTokenResponse{
 		UserID:       tokens.UserID,
 		AccessToken:  tokens.IDToken,
@@ -587,9 +833,13 @@ func GetUserProfile(c *fiber.Ctx) error {
 	return c.JSON(user)
 }
 
-// 닉네임 등록/수정
+type NicknameRequest struct {
+	UserID   string `json:"user_id"`
+	Nickname string `json:"user_nickname"`
+}
+
 func UpdateUserNickname(c *fiber.Ctx) error {
-	var req UserProfile
+	var req NicknameRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).SendString("Invalid JSON")
 	}
@@ -603,10 +853,7 @@ func UpdateUserNickname(c *fiber.Ctx) error {
 	filter := bson.M{"user_id": req.UserID}
 	update := bson.M{
 		"$set": bson.M{
-			"user_nickname":   req.Nickname, // ✅ 버그 수정(기존 nickname -> user_nickname)
-			"user_class":      req.UserClass,
-			"skill_icon_url":  req.SkillIconURL,
-			"weapon_icon_url": req.WeaponIconURL,
+			"user_nickname": req.Nickname,
 		},
 		"$setOnInsert": bson.M{
 			"created_at": time.Now().Unix(),
