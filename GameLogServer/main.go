@@ -32,11 +32,14 @@ import (
 
 // 유저 데이터
 type UserProfile struct {
-	UserID        string `json:"user_id" bson:"user_id"`       // Unity PlayerID
-	Nickname      string `json:"nickname" bson:"nickname"`     // 닉네임
-	CreatedAt     int64  `json:"created_at" bson:"created_at"` // 가입일
-	WeaponIconURL string `json:"weapon_icon_url" bson:"weapon_icon_url"`
-	SkillIconURL  string `json:"skill_icon_url" bson:"skill_icon_url"`
+	UserID        string `json:"user_id" bson:"user_id"` // Unity PlayerID
+	Nickname      string `json:"user_nickname" bson:"user_nickname"`
+	CreatedAt     int64  `json:"created_at" bson:"created_at"`
+	UserClass     string `json:"user_class,omitempty" bson:"user_class,omitempty"`
+	UserLevel     int64  `json:"user_level" bson:"user_level"`
+	UserExp       int64  `json:"user_exp" bson:"user_exp"`
+	WeaponIconURL string `json:"weapon_icon_url,omitempty" bson:"weapon_icon_url,omitempty"`
+	SkillIconURL  string `json:"skill_icon_url,omitempty" bson:"skill_icon_url,omitempty"`
 }
 
 // Unity에서 받을 로그 데이터
@@ -141,6 +144,8 @@ func main() {
 	app.Get("/api/user/profile/:id", GetUserProfile)
 	fmt.Println("[Server Log]: Posting Data on [/api/user/nickname]")
 	app.Post("/api/user/nickname", UpdateUserNickname)
+	fmt.Println("[Server Log]: Posting Data on [/api/user/class]")
+	app.Post("/api/user/class", UpdateUserClass)
 
 	fmt.Println("[Server Log]: Posting Data on [/api/log]")
 	app.Post("/api/log", IngestLog)
@@ -185,7 +190,7 @@ func initS3() {
 		log.Fatal("X AWS 환경변수(AccessKey, SecretKey, Region)가 설정되지 않았습니다.")
 	}
 
-	// 자격 증명 로드
+	// 자격 증명
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
@@ -287,8 +292,11 @@ func UpdateUserNickname(c *fiber.Ctx) error {
 	filter := bson.M{"user_id": req.UserID}
 	update := bson.M{
 		"$set": bson.M{
-			"nickname":   req.Nickname,
-			"created_at": time.Now().Unix(),
+			"nickname":      req.Nickname,
+			"user_class":    req.UserClass,
+			"SkillIconURL":  req.SkillIconURL,
+			"WeaponIconURL": req.WeaponIconURL,
+			"created_at":    time.Now().Unix(),
 		},
 	}
 	opts := options.Update().SetUpsert(true)
@@ -297,6 +305,42 @@ func UpdateUserNickname(c *fiber.Ctx) error {
 		return c.Status(500).SendString("Save Failed")
 	}
 	return c.JSON(fiber.Map{"status": "success", "nickname": req.Nickname})
+}
+
+type ClassUpdateRequest struct {
+	UserID    string `json:"user_id"`
+	UserClass string `json:"user_class"`
+}
+
+func UpdateUserClass(c *fiber.Ctx) error {
+	var req ClassUpdateRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON"})
+	}
+
+	if req.UserID == "" || req.UserClass == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "UserID and Class are required"})
+	}
+
+	// DB 업데이트 ($set을 쓰면 없는 필드는 생성하고, 있는 필드는 수정함)
+	filter := bson.M{"user_id": req.UserID}
+	update := bson.M{
+		"$set": bson.M{
+			"user_class": req.UserClass,
+		},
+	}
+
+	result, err := userCollection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "DB Update Failed"})
+	}
+
+	if result.MatchedCount == 0 {
+		return c.Status(404).JSON(fiber.Map{"error": "User not found"})
+	}
+
+	fmt.Printf("✔ User %s Class Updated: %s\n", req.UserID, req.UserClass)
+	return c.JSON(fiber.Map{"status": "success", "class": req.UserClass})
 }
 
 // 로그 저장 (Unity -> Go)
