@@ -7,7 +7,6 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,7 +22,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -150,14 +148,28 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
+type InventoryDoc struct {
+	UserID    string      `bson:"user_id"`
+	Data      interface{} `bson:"data"` // JSON 데이터를 그대로 넣을 필드
+	UpdatedAt time.Time   `bson:"updated_at"`
+}
+
+type WeaponDoc struct {
+	UserID    string      `bson:"user_id"`
+	Data      interface{} `bson:"data"` // JSON 전체를 저장
+	UpdatedAt time.Time   `bson:"updated_at"`
+}
+
 // / ========== 전역 변수(DB) ==========
 var (
 	ctx = context.Background()
 
-	userCollection  *mongo.Collection
-	authCollection  *mongo.Collection
-	logCollection   *mongo.Collection
-	storyCollection *mongo.Collection
+	userCollection      *mongo.Collection
+	authCollection      *mongo.Collection
+	logCollection       *mongo.Collection
+	storyCollection     *mongo.Collection
+	inventoryCollection *mongo.Collection
+	weaponCollection    *mongo.Collection
 
 	s3Client *s3.Client
 )
@@ -691,6 +703,8 @@ func main() {
 	authCollection = db.Collection("auth_users")
 	logCollection = db.Collection("user_raw_logs")
 	storyCollection = db.Collection("user_stories")
+	inventoryCollection = db.Collection("user_inventories")
+	weaponCollection = db.Collection("user_weapons")
 	fmt.Println("✔ MongoDB Connected")
 
 	initS3()
@@ -740,6 +754,9 @@ func main() {
 	// main() 함수 내부의 라우터 설정 부분에 추가
 	app.Post("/api/user/weapon", RequireUnityAuth, UploadUserWeapon)      // 무기 데이터 업로드
 	app.Get("/api/user/weapon/:user_id", RequireUnityAuth, GetUserWeapon) // 무기 데이터 다운로드
+
+	app.Post("/api/user/inventory", RequireUnityAuth, UploadUserInventory)      // 인벤토리 업로드
+	app.Get("/api/user/inventory/:user_id", RequireUnityAuth, GetUserInventory) // 인벤토리 다운로드
 
 	fmt.Print("\n[Server Log]: Server Started\n")
 	log.Fatal(app.Listen(":8000"))
@@ -1287,7 +1304,6 @@ func GenerateStoriesBatchJob() {
 
 /// ========== Weapon JSON Data Handlers ==========
 
-// 무기 데이터 업로드 (Unity -> Server -> S3)
 func UploadUserWeapon(c *fiber.Ctx) error {
 	// 1. 유저 인증 확인
 	userID := getAuthedUserID(c)
@@ -1295,86 +1311,151 @@ func UploadUserWeapon(c *fiber.Ctx) error {
 		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized"})
 	}
 
-	// 2. 요청 바디(JSON) 확인
-	body := c.Body()
-	if len(body) == 0 {
-		return c.Status(400).JSON(fiber.Map{"error": "Empty body"})
+	// 2. 요청 바디(JSON) 파싱
+	// Unity에서 보낸 JSON 데이터를 맵으로 받습니다.
+	var bodyData map[string]interface{}
+	if err := c.BodyParser(&bodyData); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON format"})
 	}
 
-	// 3. S3 설정 확인
-	if s3Client == nil {
-		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
+	// 3. MongoDB에 저장 (Upsert: 없으면 생성, 있으면 수정)
+	filter := bson.M{"user_id": userID}
+	update := bson.M{
+		"$set": bson.M{
+			"data":       bodyData, // JSON 본문 내용
+			"updated_at": time.Now(),
+		},
 	}
-	bucketName := os.Getenv("S3_BUCKET_NAME")
-	if bucketName == "" {
-		return c.Status(500).JSON(fiber.Map{"error": "S3_BUCKET_NAME not set"})
-	}
+	opts := options.Update().SetUpsert(true)
 
-	// 4. S3 업로드 (경로: userID/Weapon.json)
-	// 덮어쓰기 방식으로 저장되므로 항상 최신 상태 유지
-	s3Key := fmt.Sprintf("%s/Weapon.json", userID)
-
-	_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(bucketName),
-		Key:         aws.String(s3Key),
-		Body:        bytes.NewReader(body), // 받은 JSON 바이트를 그대로 업로드
-		ContentType: aws.String("application/json"),
-	})
-
+	_, err := weaponCollection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
-		log.Printf("S3 Upload Error: %v", err)
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to upload to S3"})
+		log.Printf("MongoDB Weapon Save Error: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save weapon data"})
 	}
 
 	return c.JSON(fiber.Map{
 		"status":  "success",
-		"message": "Weapon data saved",
-		"path":    s3Key,
+		"message": "Weapon data saved to DB",
 	})
 }
 
-// 무기 데이터 다운로드 (Server -> S3 -> Unity)
+// 무기 데이터 다운로드 (MongoDB -> Unity)
 func GetUserWeapon(c *fiber.Ctx) error {
-	// 1. 요청한 유저 ID 확인 (본인 혹은 타인)
 	targetUserID := c.Params("user_id")
 	if targetUserID == "" {
 		return c.Status(400).JSON(fiber.Map{"error": "user_id is required"})
 	}
 
-	// 2. S3 설정 확인
-	if s3Client == nil {
-		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
-	}
-	bucketName := os.Getenv("S3_BUCKET_NAME")
-
-	// 3. S3에서 파일 가져오기
-	s3Key := fmt.Sprintf("%s/Weapon.json", targetUserID)
-
-	result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(s3Key),
-	})
+	var result WeaponDoc
+	err := weaponCollection.FindOne(ctx, bson.M{"user_id": targetUserID}).Decode(&result)
 
 	if err != nil {
-		// 파일이 없으면 404 리턴 (아직 무기를 저장 안 한 유저)
-		var noKey *types.NoSuchKey // "github.com/aws/aws-sdk-go-v2/service/s3/types" 임포트 필요할 수 있음
-		if strings.Contains(err.Error(), "NoSuchKey") || errors.As(err, &noKey) {
+		if err == mongo.ErrNoDocuments {
 			return c.Status(404).JSON(fiber.Map{"error": "Weapon data not found"})
 		}
-		log.Printf("S3 Download Error: %v", err)
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch from S3"})
-	}
-	defer result.Body.Close()
-
-	// 4. S3 스트림을 읽어서 클라이언트에 그대로 전달
-	buf := new(bytes.Buffer)
-	if _, err := buf.ReadFrom(result.Body); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to read data"})
+		log.Printf("MongoDB Weapon Load Error: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to load weapon data"})
 	}
 
-	// JSON 헤더 설정 후 전송
-	c.Set("Content-Type", "application/json")
-	return c.Send(buf.Bytes())
+	// [수정된 부분] 깔끔한 JSON Map으로 변환 후 전송
+	cleanData := NormalizeMongoData(result.Data)
+	return c.JSON(cleanData)
+}
+
+// ... 기존 코드 하단에 추가 ...
+
+/// ========== Inventory JSON Data Handlers ==========
+
+// 인벤토리 업로드 (Unity -> MongoDB)
+func UploadUserInventory(c *fiber.Ctx) error {
+	userID := getAuthedUserID(c)
+	if userID == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized"})
+	}
+
+	// 1. 요청 바디(JSON) 파싱
+	// Unity에서 보낸 {"items": [...]} 구조를 그대로 맵으로 받습니다.
+	var bodyData map[string]interface{}
+	if err := c.BodyParser(&bodyData); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON format"})
+	}
+
+	// 2. MongoDB에 저장 (Upsert: 없으면 생성, 있으면 수정)
+	filter := bson.M{"user_id": userID}
+	update := bson.M{
+		"$set": bson.M{
+			"data":       bodyData, // {"items": ...} 전체를 저장
+			"updated_at": time.Now(),
+		},
+	}
+	opts := options.Update().SetUpsert(true)
+
+	_, err := inventoryCollection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("MongoDB Inventory Save Error: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save inventory"})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"message": "Inventory saved to DB",
+	})
+}
+
+// [중요] MongoDB BSON(primitive.D)을 일반 Map/Slice로 변환하는 재귀 함수
+func NormalizeMongoData(data interface{}) interface{} {
+	// 1. primitive.D (Key-Value 리스트)인 경우 -> Map으로 변환
+	if d, ok := data.(primitive.D); ok {
+		m := make(map[string]interface{})
+		for _, e := range d {
+			m[e.Key] = NormalizeMongoData(e.Value)
+		}
+		return m
+	}
+
+	// 2. primitive.A (배열)인 경우 -> Slice로 변환
+	if a, ok := data.(primitive.A); ok {
+		newA := make([]interface{}, len(a))
+		for i, v := range a {
+			newA[i] = NormalizeMongoData(v)
+		}
+		return newA
+	}
+
+	// 3. 그 외 기본 타입은 그대로 반환
+	return data
+}
+
+// 인벤토리 다운로드 (MongoDB -> Unity)
+func GetUserInventory(c *fiber.Ctx) error {
+	targetUserID := c.Params("user_id")
+	if targetUserID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id is required"})
+	}
+
+	var result InventoryDoc
+	err := inventoryCollection.FindOne(ctx, bson.M{"user_id": targetUserID}).Decode(&result)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return c.JSON(fiber.Map{"items": []interface{}{}})
+		}
+		log.Printf("MongoDB Inventory Load Error: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to load inventory"})
+	}
+
+	// [수정된 부분] MongoDB 데이터를 깔끔한 JSON Map으로 변환
+	cleanData := NormalizeMongoData(result.Data)
+
+	// 만약 최상위 데이터가 배열 형태라면 객체로 감싸주기 (Unity 호환성)
+	if _, ok := cleanData.([]interface{}); ok {
+		return c.JSON(fiber.Map{
+			"items": cleanData,
+		})
+	}
+
+	return c.JSON(cleanData)
 }
 
 func processUserLogs(userID string) {
