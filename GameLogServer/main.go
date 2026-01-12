@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -727,6 +729,10 @@ func main() {
 	app.Get("/api/stories/:user_id", RequireUnityAuth, GetUserStories)
 	app.Post("/api/upload/image", RequireUnityAuth, UploadImageToS3)
 
+	// main() 함수 내부의 라우터 설정 부분에 추가
+	app.Post("/api/user/weapon", RequireUnityAuth, UploadUserWeapon)      // 무기 데이터 업로드
+	app.Get("/api/user/weapon/:user_id", RequireUnityAuth, GetUserWeapon) // 무기 데이터 다운로드
+
 	fmt.Print("\n[Server Log]: Server Started\n")
 	log.Fatal(app.Listen(":8000"))
 }
@@ -1069,6 +1075,100 @@ func GenerateStoriesBatchJob() {
 			processUserLogs(userID)
 		}
 	}
+}
+
+// ... 기존 코드 하단에 추가 ...
+
+/// ========== Weapon JSON Data Handlers ==========
+
+// 무기 데이터 업로드 (Unity -> Server -> S3)
+func UploadUserWeapon(c *fiber.Ctx) error {
+	// 1. 유저 인증 확인
+	userID := getAuthedUserID(c)
+	if userID == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized"})
+	}
+
+	// 2. 요청 바디(JSON) 확인
+	body := c.Body()
+	if len(body) == 0 {
+		return c.Status(400).JSON(fiber.Map{"error": "Empty body"})
+	}
+
+	// 3. S3 설정 확인
+	if s3Client == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
+	}
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	if bucketName == "" {
+		return c.Status(500).JSON(fiber.Map{"error": "S3_BUCKET_NAME not set"})
+	}
+
+	// 4. S3 업로드 (경로: userID/Weapon.json)
+	// 덮어쓰기 방식으로 저장되므로 항상 최신 상태 유지
+	s3Key := fmt.Sprintf("%s/Weapon.json", userID)
+
+	_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(s3Key),
+		Body:        bytes.NewReader(body), // 받은 JSON 바이트를 그대로 업로드
+		ContentType: aws.String("application/json"),
+	})
+
+	if err != nil {
+		log.Printf("S3 Upload Error: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to upload to S3"})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"message": "Weapon data saved",
+		"path":    s3Key,
+	})
+}
+
+// 무기 데이터 다운로드 (Server -> S3 -> Unity)
+func GetUserWeapon(c *fiber.Ctx) error {
+	// 1. 요청한 유저 ID 확인 (본인 혹은 타인)
+	targetUserID := c.Params("user_id")
+	if targetUserID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id is required"})
+	}
+
+	// 2. S3 설정 확인
+	if s3Client == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
+	}
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+
+	// 3. S3에서 파일 가져오기
+	s3Key := fmt.Sprintf("%s/Weapon.json", targetUserID)
+
+	result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(s3Key),
+	})
+
+	if err != nil {
+		// 파일이 없으면 404 리턴 (아직 무기를 저장 안 한 유저)
+		var noKey *types.NoSuchKey // "github.com/aws/aws-sdk-go-v2/service/s3/types" 임포트 필요할 수 있음
+		if strings.Contains(err.Error(), "NoSuchKey") || errors.As(err, &noKey) {
+			return c.Status(404).JSON(fiber.Map{"error": "Weapon data not found"})
+		}
+		log.Printf("S3 Download Error: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch from S3"})
+	}
+	defer result.Body.Close()
+
+	// 4. S3 스트림을 읽어서 클라이언트에 그대로 전달
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(result.Body); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to read data"})
+	}
+
+	// JSON 헤더 설정 후 전송
+	c.Set("Content-Type", "application/json")
+	return c.Send(buf.Bytes())
 }
 
 func processUserLogs(userID string) {
