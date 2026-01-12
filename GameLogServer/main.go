@@ -1439,22 +1439,23 @@ func GetUserInventory(c *fiber.Ctx) error {
 
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return c.JSON(fiber.Map{"items": []interface{}{}})
+			// [수정 전] 빈 리스트를 200 OK로 반환했음
+			// return c.JSON(fiber.Map{"items": []interface{}{}})
+
+			// [수정 후] 명시적으로 404 Not Found 반환
+			return c.Status(404).JSON(fiber.Map{"error": "Inventory not found"})
 		}
 		log.Printf("MongoDB Inventory Load Error: %v", err)
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to load inventory"})
 	}
 
-	// [수정된 부분] MongoDB 데이터를 깔끔한 JSON Map으로 변환
+	// ... (나머지 로직 동일) ...
 	cleanData := NormalizeMongoData(result.Data)
-
-	// 만약 최상위 데이터가 배열 형태라면 객체로 감싸주기 (Unity 호환성)
 	if _, ok := cleanData.([]interface{}); ok {
 		return c.JSON(fiber.Map{
 			"items": cleanData,
 		})
 	}
-
 	return c.JSON(cleanData)
 }
 
