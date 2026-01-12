@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/rsa"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -728,6 +730,7 @@ func main() {
 	app.Post("/api/log", RequireUnityAuth, IngestLog)
 	app.Get("/api/stories/:user_id", RequireUnityAuth, GetUserStories)
 	app.Post("/api/upload/image", RequireUnityAuth, UploadImageToS3)
+	app.Post("/api/upload/highlight", RequireUnityAuth, UploadHighlightZip)
 
 	// main() 함수 내부의 라우터 설정 부분에 추가
 	app.Post("/api/user/weapon", RequireUnityAuth, UploadUserWeapon)      // 무기 데이터 업로드
@@ -989,6 +992,7 @@ func initS3() {
 	fmt.Println("✔ AWS S3 Client Connected")
 }
 
+// 이미지 업로드
 func UploadImageToS3(c *fiber.Ctx) error {
 	if s3Client == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
@@ -1057,6 +1061,192 @@ func UploadImageToS3(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"status": "success", "type": imageType, "image_url": fileURL})
+}
+
+// 하이라이트 ZIP(GIF) 업로드
+func UploadHighlightZip(c *fiber.Ctx) error {
+	if s3Client == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
+	}
+
+	userID := c.FormValue("user_id")
+	if err := mustMatchUserID(c, userID); err != nil {
+		return err
+	}
+
+	file, err := c.FormFile("zip")
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "zip file is required"})
+	}
+
+	// (선택) 업로드 크기 제한 - 예: 20MB
+	if file.Size > 20*1024*1024 {
+		return c.Status(413).JSON(fiber.Map{"error": "zip too large"})
+	}
+
+	// ffmpeg 존재 확인 (여기서 실패하면 detail이 비는 문제가 해결됨)
+	ffmpegPath := os.Getenv("FFMPEG_PATH")
+	if ffmpegPath == "" {
+		ffmpegPath = "ffmpeg"
+	}
+	ffmpegResolved, lookErr := exec.LookPath(ffmpegPath)
+	if lookErr != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error":      "ffmpeg not found",
+			"exec_error": lookErr.Error(),
+			"hint":       "install ffmpeg or set FFMPEG_PATH",
+		})
+	}
+
+	// 임시 폴더
+	workDir, err := os.MkdirTemp("", "hl_*")
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "temp dir failed", "detail": err.Error()})
+	}
+	defer os.RemoveAll(workDir)
+
+	zipPath := filepath.Join(workDir, "frames.zip")
+	if err := c.SaveFile(file, zipPath); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "save zip failed", "detail": err.Error()})
+	}
+
+	framesDir := filepath.Join(workDir, "frames")
+	if err := os.MkdirAll(framesDir, 0755); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "mkdir frames failed", "detail": err.Error()})
+	}
+	if err := unzipTo(zipPath, framesDir); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "unzip failed", "detail": err.Error()})
+	}
+
+	// 프레임 존재 확인 (없으면 ffmpeg가 당연히 실패)
+	matches, _ := filepath.Glob(filepath.Join(framesDir, "frame_*.jpg"))
+	if len(matches) == 0 {
+		return c.Status(400).JSON(fiber.Map{
+			"error":  "no frames found after unzip",
+			"detail": "expected files like frame_00001.jpg",
+		})
+	}
+
+	// ffmpeg로 GIF 생성
+	palettePath := filepath.Join(workDir, "palette.png")
+	gifPath := filepath.Join(workDir, "out.gif")
+
+	// timeout (ffmpeg 멈춤 방지)
+	ctxFF, cancel := context.WithTimeout(c.Context(), 20*time.Second)
+	defer cancel()
+
+	// ✅ 중요: -start_number 1 (Unity가 frame_00001부터 만들기 때문)
+	cmd1 := exec.CommandContext(ctxFF, ffmpegResolved,
+		"-hide_banner", "-loglevel", "error",
+		"-y",
+		"-framerate", "12",
+		"-start_number", "1",
+		"-i", filepath.Join(framesDir, "frame_%05d.jpg"),
+		"-vf", "fps=12,scale=480:-1:flags=lanczos,palettegen",
+		palettePath,
+	)
+	out1, err := cmd1.CombinedOutput()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error":      "ffmpeg palettegen failed",
+			"detail":     string(out1),
+			"exec_error": err.Error(),
+		})
+	}
+
+	cmd2 := exec.CommandContext(ctxFF, ffmpegResolved,
+		"-hide_banner", "-loglevel", "error",
+		"-y",
+		"-framerate", "12",
+		"-start_number", "1",
+		"-i", filepath.Join(framesDir, "frame_%05d.jpg"),
+		"-i", palettePath,
+		"-lavfi", "fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse",
+		gifPath,
+	)
+	out2, err := cmd2.CombinedOutput()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error":      "ffmpeg gif failed",
+			"detail":     string(out2),
+			"exec_error": err.Error(),
+		})
+	}
+
+	// S3 업로드
+	stamp := time.Now().Format("20060102_150405")
+	s3Key := fmt.Sprintf("%s/highlights/%s.gif", userID, stamp)
+
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	region := os.Getenv("AWS_REGION")
+	if bucketName == "" || region == "" {
+		return c.Status(500).JSON(fiber.Map{"error": "S3_BUCKET_NAME/AWS_REGION not configured"})
+	}
+
+	f, err := os.Open(gifPath)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "open gif failed", "detail": err.Error()})
+	}
+	defer f.Close()
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(s3Key),
+		Body:        f,
+		ContentType: aws.String("image/gif"),
+	})
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "S3 upload failed", "detail": err.Error()})
+	}
+
+	fileURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, region, s3Key)
+	return c.JSON(fiber.Map{"status": "success", "gif_url": fileURL})
+}
+
+func unzipTo(zipFile, dest string) error {
+	r, err := zip.OpenReader(zipFile)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fp := filepath.Join(dest, f.Name)
+		if !strings.HasPrefix(fp, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(fp, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fp), 0755); err != nil {
+			return err
+		}
+
+		src, err := f.Open()
+		if err != nil {
+			return err
+		}
+		// ✅ defer 쓰지 말고 즉시 닫기
+		dst, err := os.Create(fp)
+		if err != nil {
+			src.Close()
+			return err
+		}
+
+		_, cpErr := io.Copy(dst, src)
+		dst.Close()
+		src.Close()
+
+		if cpErr != nil {
+			return cpErr
+		}
+	}
+	return nil
 }
 
 /// ========== AI 배치 ==========
