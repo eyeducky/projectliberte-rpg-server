@@ -1097,6 +1097,10 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "zip file is required"})
 	}
 
+	// 용량 제한 (20MB)
+	if file.Size > 20*1024*1024 {
+		return c.Status(413).JSON(fiber.Map{"error": "zip too large"})
+	}
 	// 임시 작업 폴더
 	workDir, err := os.MkdirTemp("", "hl_*")
 	if err != nil {
