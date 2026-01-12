@@ -125,6 +125,11 @@ type Story struct {
 	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
 }
 
+type HighlightDetail struct {
+	Reason string `bson:"reason" json:"reason"`
+	GifURL string `bson:"gif_url" json:"gif_url"`
+}
+
 // Gemini API 통신용 구조체
 type GeminiRequest struct {
 	Contents []GeminiContent `json:"contents"`
@@ -1069,9 +1074,22 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "S3 not configured"})
 	}
 
+	// ✅ ffmpeg 설치 여부 먼저 확인 (에러 메시지 명확하게)
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error":  "ffmpeg not found",
+			"detail": "ffmpeg가 설치되어 있지 않거나 PATH에 없습니다.",
+		})
+	}
+
 	userID := c.FormValue("user_id")
 	if err := mustMatchUserID(c, userID); err != nil {
 		return err
+	}
+
+	reason := strings.TrimSpace(c.FormValue("reason"))
+	if reason == "" {
+		reason = "highlight"
 	}
 
 	file, err := c.FormFile("zip")
@@ -1079,29 +1097,10 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "zip file is required"})
 	}
 
-	// (선택) 업로드 크기 제한 - 예: 20MB
-	if file.Size > 20*1024*1024 {
-		return c.Status(413).JSON(fiber.Map{"error": "zip too large"})
-	}
-
-	// ffmpeg 존재 확인 (여기서 실패하면 detail이 비는 문제가 해결됨)
-	ffmpegPath := os.Getenv("FFMPEG_PATH")
-	if ffmpegPath == "" {
-		ffmpegPath = "ffmpeg"
-	}
-	ffmpegResolved, lookErr := exec.LookPath(ffmpegPath)
-	if lookErr != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"error":      "ffmpeg not found",
-			"exec_error": lookErr.Error(),
-			"hint":       "install ffmpeg or set FFMPEG_PATH",
-		})
-	}
-
-	// 임시 폴더
+	// 임시 작업 폴더
 	workDir, err := os.MkdirTemp("", "hl_*")
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "temp dir failed", "detail": err.Error()})
+		return c.Status(500).JSON(fiber.Map{"error": "temp dir failed"})
 	}
 	defer os.RemoveAll(workDir)
 
@@ -1114,63 +1113,40 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 	if err := os.MkdirAll(framesDir, 0755); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "mkdir frames failed", "detail": err.Error()})
 	}
-	if err := unzipTo(zipPath, framesDir); err != nil {
+	if err := unzipToSafe(zipPath, framesDir); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "unzip failed", "detail": err.Error()})
-	}
-
-	// 프레임 존재 확인 (없으면 ffmpeg가 당연히 실패)
-	matches, _ := filepath.Glob(filepath.Join(framesDir, "frame_*.jpg"))
-	if len(matches) == 0 {
-		return c.Status(400).JSON(fiber.Map{
-			"error":  "no frames found after unzip",
-			"detail": "expected files like frame_00001.jpg",
-		})
 	}
 
 	// ffmpeg로 GIF 생성
 	palettePath := filepath.Join(workDir, "palette.png")
 	gifPath := filepath.Join(workDir, "out.gif")
 
-	// timeout (ffmpeg 멈춤 방지)
-	ctxFF, cancel := context.WithTimeout(c.Context(), 20*time.Second)
-	defer cancel()
+	// ※ Unity에서 frame_00001.jpg 형태로 만들었으니 여기 패턴과 일치해야 함.
+	// fps/scale 값은 Unity 캡처 설정과 맞추는게 제일 깔끔.
+	const fps = "12"
+	const scale = "480:-1"
 
-	// ✅ 중요: -start_number 1 (Unity가 frame_00001부터 만들기 때문)
-	cmd1 := exec.CommandContext(ctxFF, ffmpegResolved,
-		"-hide_banner", "-loglevel", "error",
+	cmd1 := exec.Command("ffmpeg",
 		"-y",
-		"-framerate", "12",
-		"-start_number", "1",
+		"-framerate", fps,
 		"-i", filepath.Join(framesDir, "frame_%05d.jpg"),
-		"-vf", "fps=12,scale=480:-1:flags=lanczos,palettegen",
+		"-vf", fmt.Sprintf("fps=%s,scale=%s:flags=lanczos,palettegen", fps, scale),
 		palettePath,
 	)
-	out1, err := cmd1.CombinedOutput()
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"error":      "ffmpeg palettegen failed",
-			"detail":     string(out1),
-			"exec_error": err.Error(),
-		})
+	if out, err := cmd1.CombinedOutput(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "ffmpeg palettegen failed", "detail": string(out)})
 	}
 
-	cmd2 := exec.CommandContext(ctxFF, ffmpegResolved,
-		"-hide_banner", "-loglevel", "error",
+	cmd2 := exec.Command("ffmpeg",
 		"-y",
-		"-framerate", "12",
-		"-start_number", "1",
+		"-framerate", fps,
 		"-i", filepath.Join(framesDir, "frame_%05d.jpg"),
 		"-i", palettePath,
-		"-lavfi", "fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse",
+		"-lavfi", fmt.Sprintf("fps=%s,scale=%s:flags=lanczos[x];[x][1:v]paletteuse", fps, scale),
 		gifPath,
 	)
-	out2, err := cmd2.CombinedOutput()
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"error":      "ffmpeg gif failed",
-			"detail":     string(out2),
-			"exec_error": err.Error(),
-		})
+	if out, err := cmd2.CombinedOutput(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "ffmpeg gif failed", "detail": string(out)})
 	}
 
 	// S3 업로드
@@ -1199,20 +1175,56 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "S3 upload failed", "detail": err.Error()})
 	}
 
-	fileURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, region, s3Key)
-	return c.JSON(fiber.Map{"status": "success", "gif_url": fileURL})
+	gifURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, region, s3Key)
+
+	// ✅ 여기서 로그를 “서버에서” 바로 저장
+	logDoc := RawLog{
+		UserID:      userID,
+		EventType:   "highlight",
+		Detail:      HighlightDetail{Reason: reason, GifURL: gifURL}, // 또는 bson.M{"reason": reason, "gif_url": gifURL}
+		MediaURL:    gifURL,
+		Timestamp:   time.Now(),
+		IsProcessed: false,
+	}
+
+	ins, err := logCollection.InsertOne(ctx, logDoc)
+	if err != nil {
+		// (선택) 일관성 유지: DB 저장 실패 시 S3 파일 삭제 시도
+		// IAM에 s3:DeleteObject 권한 필요
+		_, _ = s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(s3Key),
+		})
+
+		return c.Status(500).JSON(fiber.Map{
+			"error":   "log insert failed",
+			"detail":  err.Error(),
+			"gif_url": gifURL, // 참고로 업로드는 성공했었음(삭제 실패 가능성도 있으니 정보 제공)
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"gif_url": gifURL,
+		"log_id":  ins.InsertedID,
+	})
 }
 
-func unzipTo(zipFile, dest string) error {
+func unzipToSafe(zipFile, dest string) error {
 	r, err := zip.OpenReader(zipFile)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
+	base := filepath.Clean(dest) + string(os.PathSeparator)
+
 	for _, f := range r.File {
 		fp := filepath.Join(dest, f.Name)
-		if !strings.HasPrefix(fp, filepath.Clean(dest)+string(os.PathSeparator)) {
+
+		// zip slip 방지
+		if !strings.HasPrefix(filepath.Clean(fp)+string(os.PathSeparator), base) &&
+			filepath.Clean(fp) != filepath.Clean(dest) {
 			return fmt.Errorf("illegal file path: %s", f.Name)
 		}
 
@@ -1231,19 +1243,19 @@ func unzipTo(zipFile, dest string) error {
 		if err != nil {
 			return err
 		}
-		// ✅ defer 쓰지 말고 즉시 닫기
+
 		dst, err := os.Create(fp)
 		if err != nil {
 			src.Close()
 			return err
 		}
 
-		_, cpErr := io.Copy(dst, src)
+		_, copyErr := io.Copy(dst, src)
 		dst.Close()
 		src.Close()
 
-		if cpErr != nil {
-			return cpErr
+		if copyErr != nil {
+			return copyErr
 		}
 	}
 	return nil
