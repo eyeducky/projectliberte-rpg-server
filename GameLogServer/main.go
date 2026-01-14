@@ -359,6 +359,7 @@ func verifyUnityIDToken(idToken string) (jwt.MapClaims, error) {
 	},
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer("https://player-auth.services.api.unity.com"),
+		jwt.WithLeeway(2*time.Minute),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("jwt verify 실패: %w", err)
@@ -1227,7 +1228,7 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 	logDoc := RawLog{
 		UserID:      userID,
 		EventType:   "highlight",
-		Detail:      HighlightDetail{Reason: reason, GifURL: gifURL}, // 또는 bson.M{"reason": reason, "gif_url": gifURL}
+		Detail:      HighlightDetail{Reason: reason}, // 또는 bson.M{"reason": reason, "gif_url": gifURL}
 		MediaURL:    gifURL,
 		Timestamp:   time.Now(),
 		IsProcessed: false,
@@ -1245,7 +1246,7 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{
 			"error":   "log insert failed",
 			"detail":  err.Error(),
-			"gif_url": gifURL, // 참고로 업로드는 성공했었음(삭제 실패 가능성도 있으니 정보 제공)
+			"gif_url": gifURL,
 		})
 	}
 
