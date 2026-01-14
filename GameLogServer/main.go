@@ -172,6 +172,9 @@ var (
 	weaponCollection    *mongo.Collection
 
 	s3Client *s3.Client
+
+	postCollection       *mongo.Collection
+	webProfileCollection *mongo.Collection
 )
 
 /// ========== Unity 토큰 캐시(Stateless Token) ==========
@@ -730,6 +733,25 @@ func main() {
 		AllowCredentials: true, // ★ 쿠키 사용
 	}))
 
+	inventoryCollection = db.Collection("user_inventories")
+	weaponCollection = db.Collection("user_weapons")
+
+	// [SNS 추가] DB 컬렉션 연결
+	postCollection = db.Collection("community_posts")
+	webProfileCollection = db.Collection("web_profiles")
+
+	// [SNS 추가] 커뮤니티 API 라우터 (기존 라우터 아래에 추가)
+	// 1. 게시물 관련
+	app.Get("/api/posts", GetPosts)                            // 전체 글 조회
+	app.Post("/api/posts", RequireWebAuth, CreatePost)         // 글 쓰기
+	app.Delete("/api/posts/:id", RequireWebAuth, DeletePost)   // 글 삭제
+	app.Post("/api/posts/like", RequireWebAuth, ToggleLike)    // 좋아요 토글
+	app.Post("/api/posts/comment", RequireWebAuth, AddComment) // 댓글 달기
+
+	// 2. 웹 프로필 관련 (게임 프로필과 분리)
+	app.Get("/api/web/profile/:login_id", GetWebProfile)           // 프로필 조회
+	app.Post("/api/web/profile", RequireWebAuth, UpdateWebProfile) // 프로필 수정
+
 	/// ---- Auth (public) ----
 	app.Post("/api/auth/register", Register)
 	app.Post("/api/auth/login", Login)
@@ -757,6 +779,9 @@ func main() {
 
 	app.Post("/api/user/inventory", RequireUnityAuth, UploadUserInventory)      // 인벤토리 업로드
 	app.Get("/api/user/inventory/:user_id", RequireUnityAuth, GetUserInventory) // 인벤토리 다운로드
+
+	app.Post("/api/posts/comment", RequireWebAuth, AddComment) // 댓글 달기
+	app.Delete("/api/posts/:post_id/comments/:comment_id", RequireWebAuth, DeleteComment)
 
 	fmt.Print("\n[Server Log]: Server Started\n")
 	log.Fatal(app.Listen(":8000"))
@@ -1593,4 +1618,279 @@ func callGemini(nickname, logData string, prevStory string) (string, string) {
 	}
 	title = strings.Trim(title, "\"'# *")
 	return content, title
+
+}
+
+/// ========== [SNS 추가] 커뮤니티 기능 (Community Features) ==========
+
+// 1. 데이터 모델 구조체
+type WebProfile struct {
+	LoginID   string    `bson:"login_id" json:"login_id"`
+	Avatar    string    `bson:"avatar" json:"avatar"` // 프로필 사진 (Base64 or URL)
+	Bio       string    `bson:"bio" json:"bio"`       // 자기소개
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+}
+
+type CommunityComment struct {
+	ID        string    `bson:"id" json:"id"`
+	LoginID   string    `bson:"login_id" json:"user"`
+	Text      string    `bson:"text" json:"text"`
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+}
+
+type CommunityPost struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	LoginID   string             `bson:"login_id" json:"user"` // 작성자 ID
+	Avatar    string             `bson:"avatar" json:"avatar"` // 작성 당시 프사
+	Image     string             `bson:"image" json:"img"`     // 게시물 이미지 (Base64)
+	Caption   string             `bson:"caption" json:"caption"`
+	Tags      []string           `bson:"tags" json:"tags"`
+	Likes     int                `bson:"likes" json:"likes"`
+	LikedBy   []string           `bson:"liked_by" json:"likedBy"` // 좋아요 누른 사람들 목록
+	Comments  []CommunityComment `bson:"comments" json:"comments"`
+	CreatedAt time.Time          `bson:"created_at" json:"date"`
+}
+
+// 2. 핸들러 구현
+
+// 게시물 목록 조회 (GET /api/posts)
+func GetPosts(c *fiber.Ctx) error {
+	// 최신순 정렬
+	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}})
+	cursor, err := postCollection.Find(ctx, bson.M{}, opts)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "DB Error"})
+	}
+	var posts []CommunityPost
+	if err = cursor.All(ctx, &posts); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Data Error"})
+	}
+	// 빈 배열이라도 null 대신 [] 리턴
+	if posts == nil {
+		posts = []CommunityPost{}
+	}
+	return c.JSON(posts)
+}
+
+// 게시물 작성 (POST /api/posts)
+func CreatePost(c *fiber.Ctx) error {
+	loginID := c.Locals("login_id").(string) // 미들웨어에서 가져옴
+
+	var req CommunityPost
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON"})
+	}
+
+	// 서버 필드 강제 설정
+	req.ID = primitive.NewObjectID()
+	req.LoginID = loginID
+	req.Likes = 0
+	req.LikedBy = []string{}
+	req.Comments = []CommunityComment{}
+	req.CreatedAt = time.Now()
+
+	// (선택) 프로필 정보가 있다면 최신 아바타로 덮어쓰기 가능
+	// 여기서는 클라이언트가 보낸 req.Avatar를 믿거나, DB에서 조회해서 넣을 수 있음.
+	// 일단 클라이언트 값을 존중하되 비어있으면 기본값 처리
+	if req.Avatar == "" {
+		req.Avatar = "https://ui-avatars.com/api/?name=" + loginID + "&background=333&color=fff"
+	}
+
+	_, err := postCollection.InsertOne(ctx, req)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Write Failed"})
+	}
+	return c.JSON(fiber.Map{"status": "success", "post": req})
+}
+
+// 게시물 삭제 (DELETE /api/posts/:id)
+func DeletePost(c *fiber.Ctx) error {
+	loginID := c.Locals("login_id").(string)
+	postIDHex := c.Params("id")
+	postID, err := primitive.ObjectIDFromHex(postIDHex)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid ID"})
+	}
+
+	// 작성자 본인인지 확인 후 삭제
+	res, err := postCollection.DeleteOne(ctx, bson.M{"_id": postID, "login_id": loginID})
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Delete Error"})
+	}
+	if res.DeletedCount == 0 {
+		return c.Status(403).JSON(fiber.Map{"error": "권한이 없거나 게시물이 없습니다."})
+	}
+	return c.JSON(fiber.Map{"status": "success"})
+}
+
+// 좋아요 토글 (POST /api/posts/like)
+func ToggleLike(c *fiber.Ctx) error {
+	loginID := c.Locals("login_id").(string)
+
+	var req struct {
+		PostIDHex string `json:"post_id"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON"})
+	}
+
+	postID, err := primitive.ObjectIDFromHex(req.PostIDHex)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid Post ID"})
+	}
+
+	// 이미 좋아요 눌렀는지 확인
+	var post CommunityPost
+	err = postCollection.FindOne(ctx, bson.M{"_id": postID}).Decode(&post)
+	if err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "Post not found"})
+	}
+
+	liked := false
+	for _, user := range post.LikedBy {
+		if user == loginID {
+			liked = true
+			break
+		}
+	}
+
+	if liked {
+		// 좋아요 취소 ($pull)
+		_, _ = postCollection.UpdateOne(ctx, bson.M{"_id": postID}, bson.M{
+			"$inc":  bson.M{"likes": -1},
+			"$pull": bson.M{"liked_by": loginID},
+		})
+	} else {
+		// 좋아요 추가 ($addToSet)
+		_, _ = postCollection.UpdateOne(ctx, bson.M{"_id": postID}, bson.M{
+			"$inc":      bson.M{"likes": 1},
+			"$addToSet": bson.M{"liked_by": loginID},
+		})
+	}
+
+	return c.JSON(fiber.Map{"status": "success", "liked": !liked})
+}
+
+func AddComment(c *fiber.Ctx) error {
+	loginID := c.Locals("login_id").(string)
+
+	var req struct {
+		PostIDHex string `json:"post_id"`
+		Text      string `json:"text"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON"})
+	}
+
+	postID, err := primitive.ObjectIDFromHex(req.PostIDHex)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid Post ID"})
+	}
+
+	newComment := CommunityComment{
+		ID:        primitive.NewObjectID().Hex(), // [핵심] 댓글마다 고유 ID 부여
+		LoginID:   loginID,
+		Text:      req.Text,
+		CreatedAt: time.Now(),
+	}
+
+	_, err = postCollection.UpdateOne(ctx, bson.M{"_id": postID}, bson.M{
+		"$push": bson.M{"comments": newComment},
+	})
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Comment Failed"})
+	}
+
+	return c.JSON(fiber.Map{"status": "success", "comment": newComment})
+}
+
+// [신규 추가] 댓글 삭제
+func DeleteComment(c *fiber.Ctx) error {
+	loginID := c.Locals("login_id").(string)
+	postIDHex := c.Params("post_id")
+	commentID := c.Params("comment_id")
+
+	postID, err := primitive.ObjectIDFromHex(postIDHex)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid Post ID"})
+	}
+
+	// 1. 해당 게시물 찾기 (권한 체크를 위해)
+	var post CommunityPost
+	err = postCollection.FindOne(ctx, bson.M{"_id": postID}).Decode(&post)
+	if err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "Post not found"})
+	}
+
+	// 2. 삭제 권한 확인: (댓글 작성자 본인) OR (게시물 주인) 이면 삭제 가능
+	canDelete := false
+	if post.LoginID == loginID {
+		canDelete = true // 게시물 주인은 모든 댓글 삭제 가능
+	} else {
+		// 댓글 작성자인지 확인
+		for _, comment := range post.Comments {
+			if comment.ID == commentID && comment.LoginID == loginID {
+				canDelete = true
+				break
+			}
+		}
+	}
+
+	if !canDelete {
+		return c.Status(403).JSON(fiber.Map{"error": "삭제 권한이 없습니다."})
+	}
+
+	// 3. DB에서 댓글 제거 ($pull 사용)
+	_, err = postCollection.UpdateOne(ctx, bson.M{"_id": postID}, bson.M{
+		"$pull": bson.M{"comments": bson.M{"id": commentID}},
+	})
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Delete Failed"})
+	}
+
+	return c.JSON(fiber.Map{"status": "success"})
+}
+
+// 웹 프로필 조회 (GET /api/web/profile/:login_id)
+func GetWebProfile(c *fiber.Ctx) error {
+	targetID := c.Params("login_id")
+	var profile WebProfile
+	err := webProfileCollection.FindOne(ctx, bson.M{"login_id": targetID}).Decode(&profile)
+	if err != nil {
+		// 프로필 없으면 기본값 리턴
+		return c.JSON(WebProfile{
+			LoginID: targetID,
+			Bio:     "Welcome to LIBERTÉ Community",
+			Avatar:  "https://ui-avatars.com/api/?name=" + targetID + "&background=333&color=fff",
+		})
+	}
+	return c.JSON(profile)
+}
+
+// 웹 프로필 수정 (POST /api/web/profile)
+func UpdateWebProfile(c *fiber.Ctx) error {
+	loginID := c.Locals("login_id").(string)
+
+	var req WebProfile
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid JSON"})
+	}
+
+	// 본인 ID 강제
+	filter := bson.M{"login_id": loginID}
+	update := bson.M{
+		"$set": bson.M{
+			"avatar":     req.Avatar,
+			"bio":        req.Bio,
+			"updated_at": time.Now(),
+		},
+	}
+	opts := options.Update().SetUpsert(true)
+
+	_, err := webProfileCollection.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Profile Update Failed"})
+	}
+
+	return c.JSON(fiber.Map{"status": "success"})
 }

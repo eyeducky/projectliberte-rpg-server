@@ -5,7 +5,7 @@ $env:GOOS = "linux"
 $env:GOARCH = "amd64"
 
 # 3. 빌드 (확장자 없는 파일이 생성됩니다)
-go build -o game-server main.go
+go build -o app main.go
 
 # 4. (중요) 다시 윈도우 설정으로 되돌리기 (나중을 위해)
 $env:GOOS = "windows"
