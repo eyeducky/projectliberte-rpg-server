@@ -1,11 +1,7 @@
-# 1. 운영체제(OS)를 리눅스로 설정
-$env:GOOS = "linux"
+$env:GOOS="linux"
+$env:GOARCH="amd64"
+$env:CGO_ENABLED="0"
 
-# 2. CPU 아키텍처를 amd64(대부분의 서버)로 설정
-$env:GOARCH = "amd64"
+go build -o app -trimpath -ldflags "-s -w" .
 
-# 3. 빌드 (확장자 없는 파일이 생성됩니다)
-go build -o app main.go
-
-# 4. (중요) 다시 윈도우 설정으로 되돌리기 (나중을 위해)
 $env:GOOS = "windows"

@@ -116,11 +116,19 @@ type RawLog struct {
 
 // 생성된 이야기 데이터
 type Story struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"story_id"`
-	UserID    string             `bson:"user_id" json:"user_id"`
-	Title     string             `bson:"title" json:"title"`
-	Content   string             `bson:"content" json:"content"`
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	ID         primitive.ObjectID `bson:"_id,omitempty" json:"story_id"`
+	UserID     string             `bson:"user_id" json:"user_id"`
+	Title      string             `bson:"title" json:"title"`
+	Content    string             `bson:"content" json:"content"`
+	CreatedAt  time.Time          `bson:"created_at" json:"created_at"`
+	Highlights []StoryHighlight   `bson:"highlights,omitempty" json:"highlights,omitempty"`
+}
+
+type StoryHighlight struct {
+	LogID     string    `bson:"log_id" json:"log_id"`
+	GifURL    string    `bson:"gif_url" json:"gif_url"`
+	Reason    string    `bson:"reason,omitempty" json:"reason,omitempty"`
+	Timestamp time.Time `bson:"timestamp" json:"timestamp"`
 }
 
 type HighlightDetail struct {
@@ -359,7 +367,6 @@ func verifyUnityIDToken(idToken string) (jwt.MapClaims, error) {
 	},
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer("https://player-auth.services.api.unity.com"),
-		jwt.WithLeeway(2*time.Minute),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("jwt verify 실패: %w", err)
@@ -740,6 +747,8 @@ func main() {
 	// [SNS 추가] DB 컬렉션 연결
 	postCollection = db.Collection("community_posts")
 	webProfileCollection = db.Collection("web_profiles")
+
+	// ... (기존 코드) ...
 
 	// [SNS 추가] 커뮤니티 API 라우터 (기존 라우터 아래에 추가)
 	// 1. 게시물 관련
@@ -1228,7 +1237,7 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 	logDoc := RawLog{
 		UserID:      userID,
 		EventType:   "highlight",
-		Detail:      HighlightDetail{Reason: reason}, // 또는 bson.M{"reason": reason, "gif_url": gifURL}
+		Detail:      HighlightDetail{Reason: reason, GifURL: gifURL}, // 또는 bson.M{"reason": reason, "gif_url": gifURL}
 		MediaURL:    gifURL,
 		Timestamp:   time.Now(),
 		IsProcessed: false,
@@ -1246,15 +1255,56 @@ func UploadHighlightZip(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{
 			"error":   "log insert failed",
 			"detail":  err.Error(),
-			"gif_url": gifURL,
+			"gif_url": gifURL, // 참고로 업로드는 성공했었음(삭제 실패 가능성도 있으니 정보 제공)
 		})
 	}
+	// 1. 해당 Unity UserID와 연동된 웹 계정 찾기 (작성자 표기용)
+	var authUser AuthUser
+	postWriterName := userID // 기본값: Unity ID
+	postAvatar := "https://ui-avatars.com/api/?name=" + userID + "&background=0044cc&color=fff"
+
+	// Unity ID로 웹 계정 조회
+	if err := authCollection.FindOne(ctx, bson.M{"unity_user_id": userID}).Decode(&authUser); err == nil {
+		postWriterName = authUser.LoginID // 연동된 웹 ID 사용
+
+		// 웹 프로필(프사) 조회
+		var webProf WebProfile
+		if err := webProfileCollection.FindOne(ctx, bson.M{"login_id": authUser.LoginID}).Decode(&webProf); err == nil {
+			if webProf.Avatar != "" {
+				postAvatar = webProf.Avatar
+			}
+		}
+	}
+
+	// 2. 게시물 생성 및 저장
+	autoPost := CommunityPost{
+		ID:        primitive.NewObjectID(),
+		LoginID:   postWriterName,
+		Avatar:    postAvatar,
+		Image:     gifURL, // S3에 업로드된 GIF URL
+		Caption:   "[System] " + reason + " 순간이 기록되었습니다.",
+		Tags:      []string{"#Highlight", "#PlayRecord", "#LIBERTE"},
+		Likes:     0,
+		LikedBy:   []string{},
+		Comments:  []CommunityComment{},
+		CreatedAt: time.Now(),
+	}
+
+	if _, err := postCollection.InsertOne(ctx, autoPost); err != nil {
+		// 게시물 등록 실패해도 게임 로그는 남았으므로 에러 로그만 출력하고 진행
+		log.Printf("⚠ 커뮤니티 자동 포스팅 실패: %v", err)
+	} else {
+		log.Printf("✔ 커뮤니티 자동 포스팅 완료: %s", autoPost.ID.Hex())
+	}
+
+	// =========================================================================
 
 	return c.JSON(fiber.Map{
 		"status":  "success",
 		"gif_url": gifURL,
 		"log_id":  ins.InsertedID,
 	})
+
 }
 
 func unzipToSafe(zipFile, dest string) error {
@@ -1501,6 +1551,21 @@ func processUserLogs(userID string) {
 		return
 	}
 
+	highlights := make([]StoryHighlight, 0)
+	for _, l := range logs {
+		if strings.EqualFold(l.EventType, "highlight") {
+			reason, gif := extractHighlight(l.Detail, l.MediaURL)
+			if gif != "" {
+				highlights = append(highlights, StoryHighlight{
+					LogID:     l.ID.Hex(),
+					GifURL:    gif,
+					Reason:    reason,
+					Timestamp: l.Timestamp,
+				})
+			}
+		}
+	}
+
 	var prevStory Story
 	prevStoryText := "없음 (이번이 첫 모험입니다.)"
 	findOptions := options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}})
@@ -1529,11 +1594,13 @@ func processUserLogs(userID string) {
 	}
 
 	newStory := Story{
-		UserID:    userID,
-		Title:     storyTitle,
-		Content:   storyContent,
-		CreatedAt: time.Now(),
+		UserID:     userID,
+		Title:      storyTitle,
+		Content:    storyContent,
+		CreatedAt:  time.Now(),
+		Highlights: highlights,
 	}
+
 	_, _ = storyCollection.InsertOne(ctx, newStory)
 
 	var logIDs []primitive.ObjectID
@@ -1546,6 +1613,34 @@ func processUserLogs(userID string) {
 	)
 
 	fmt.Printf("✔ User %s: 스토리 생성 완료!\n", userID)
+}
+
+func extractHighlight(detail interface{}, mediaURL string) (reason string, gif string) {
+	gif = mediaURL
+
+	// Mongo에서 interface{}로 들어오면 보통 map 형태로 옴
+	switch d := detail.(type) {
+	case bson.M:
+		if r, ok := d["reason"].(string); ok {
+			reason = r
+		}
+		if gif == "" {
+			if g, ok := d["gif_url"].(string); ok {
+				gif = g
+			}
+		}
+	case map[string]interface{}:
+		if r, ok := d["reason"].(string); ok {
+			reason = r
+		}
+		if gif == "" {
+			if g, ok := d["gif_url"].(string); ok {
+				gif = g
+			}
+		}
+	}
+
+	return
 }
 
 func callGemini(nickname, logData string, prevStory string) (string, string) {
